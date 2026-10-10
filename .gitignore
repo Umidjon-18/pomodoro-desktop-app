@@ -1,0 +1,5 @@
+build/
+Pomodoro.xcodeproj/
+*.xcuserstate
+.DS_Store
+dist/

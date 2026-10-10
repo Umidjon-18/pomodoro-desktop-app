@@ -1,0 +1,145 @@
+#!/bin/sh
+# pomodoro-hosts — maintains the Pomodoro block inside /etc/hosts.
+#
+# Installed root:wheel 0755 at /usr/local/libexec/pomodoro-hosts and run by the
+# Pomodoro app through a sudoers NOPASSWD rule, so every argument is untrusted.
+#
+#   pomodoro-hosts apply <domain>...   replace the marker block with these domains
+#   pomodoro-hosts clear               remove the marker block
+#   pomodoro-hosts status              print "active" or "inactive"
+#
+# Only the lines between the markers are ever touched; the rest of the file is
+# copied verbatim and the result replaces the original atomically.
+
+set -eu
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+LC_ALL=C
+export LC_ALL
+umask 022
+IFS='
+ 	'
+set -f
+
+BEGIN_MARKER='# >>> pomodoro >>>'
+END_MARKER='# <<< pomodoro <<<'
+MAX_DOMAINS=500
+
+die() {
+    printf 'pomodoro-hosts: %s\n' "$1" >&2
+    exit "${2:-1}"
+}
+
+usage() {
+    printf 'usage: pomodoro-hosts apply <domain>... | clear | status\n' >&2
+    exit 2
+}
+
+# Strict hostname check: lowercase ASCII letters, digits, '-' and '.', at least
+# two labels, each 1-63 chars without a leading/trailing '-', total <= 253, and a
+# non-numeric last label (IPv4 literals cannot be blocked through hosts).
+valid_domain() {
+    d=$1
+    case $d in
+        '' | *[!a-z0-9.-]* | .* | *. | *..* | -* | *- | *.-* | *-.*) return 1 ;;
+        *.*) ;;
+        *) return 1 ;;
+    esac
+    [ "${#d}" -le 253 ] || return 1
+    # The case above guarantees a single line of safe characters, so grep sees
+    # exactly one record here.
+    if printf '%s\n' "$d" | grep -Eq '[a-z0-9-]{64}'; then
+        return 1
+    fi
+    case ${d##*.} in
+        *[!0-9]*) ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+euid=$(id -u)
+if [ "$euid" -eq 0 ]; then
+    hosts=/etc/hosts
+else
+    # Unprivileged runs exist only for automated tests and must name a scratch file.
+    hosts=${POMODORO_TEST_HOSTS_FILE:-}
+    [ -n "$hosts" ] || die 'must run as root (or set POMODORO_TEST_HOSTS_FILE for tests)'
+fi
+
+[ $# -ge 1 ] || usage
+command=$1
+shift
+
+case $command in
+    apply)
+        [ $# -ge 1 ] || usage
+        [ $# -le "$MAX_DOMAINS" ] || die "too many domains (max $MAX_DOMAINS)"
+        for d in "$@"; do
+            valid_domain "$d" || die 'invalid domain rejected; hosts file not modified'
+        done
+        ;;
+    clear)
+        [ $# -eq 0 ] || usage
+        ;;
+    status)
+        [ $# -eq 0 ] || usage
+        [ -f "$hosts" ] || die "hosts file not found: $hosts"
+        if grep -Fxq -- "$BEGIN_MARKER" "$hosts"; then
+            echo active
+        else
+            echo inactive
+        fi
+        exit 0
+        ;;
+    *)
+        usage
+        ;;
+esac
+
+[ -f "$hosts" ] || die "hosts file not found: $hosts"
+[ ! -L "$hosts" ] || die "refusing to replace a symlink: $hosts"
+
+dir=$(dirname -- "$hosts")
+tmp=$(mktemp "$dir/.pomodoro-hosts.XXXXXX") || die 'cannot create temporary file'
+trap 'rm -f -- "$tmp"' EXIT HUP INT TERM
+
+# Copy everything outside a complete marker block. If a begin marker has no
+# matching end marker the buffered lines are kept, so nothing is ever lost.
+awk -v b="$BEGIN_MARKER" -v e="$END_MARKER" '
+    inblock {
+        buf = buf $0 "\n"
+        if ($0 == e) { inblock = 0; buf = "" }
+        next
+    }
+    $0 == b { inblock = 1; buf = $0 "\n"; next }
+    { print }
+    END { if (inblock) printf "%s", buf }
+' "$hosts" > "$tmp" || die 'failed to read hosts file'
+
+if [ "$command" = apply ]; then
+    {
+        printf '%s\n' "$BEGIN_MARKER"
+        for d in "$@"; do
+            printf '0.0.0.0 %s\n::1 %s\n' "$d" "$d"
+            case $d in
+                www.*) ;;
+                *) printf '0.0.0.0 www.%s\n::1 www.%s\n' "$d" "$d" ;;
+            esac
+        done
+        printf '%s\n' "$END_MARKER"
+    } >> "$tmp" || die 'failed to write temporary file'
+fi
+
+chmod 644 "$tmp"
+if [ "$euid" -eq 0 ]; then
+    chown root:wheel "$tmp"
+fi
+mv -f -- "$tmp" "$hosts" || die 'failed to replace hosts file'
+trap - EXIT HUP INT TERM
+
+if [ "$euid" -eq 0 ]; then
+    /usr/bin/dscacheutil -flushcache || true
+    /usr/bin/killall -HUP mDNSResponder 2>/dev/null || true
+fi
+exit 0
